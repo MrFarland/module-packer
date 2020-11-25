@@ -1,9 +1,40 @@
 # Change Log
 
-## [Unreleased]
+## 1.0.21
+
+### Changed
+- `parent` value now supported generically on pages and groups
+- Removed deprecated `role` field from Monsters
+
+## 1.0.20
+
+### Fixed
+- Fixed module packer creating a compendium.xml when there was no compendium data
+
+## 1.0.19
+
+### Added
+- Added ability to export compendium items (monsters) with module
+- Added the ability to include maps
+- Added the ability to include encounters
+- Added the ability to have nested pages under other nested pages
+
+### Changed
+- `.size-full` attribute now groups ahead of module pagebreaks like `.size-full` does
+
+## 1.0.18
+
+### Fixed
+- Fixed sidebar tables not having proper width by default
+- Fixed page contents being inappropriately wrapped in HTML/Body tags when exporting to module
+- Fixed nested pages generated from pagebreaks not maintaining sort order
+- Fixed pages duplicating on PDF output when placed at root level
+
+## 1.0.17
 
 ### Added
 - Generic `.center` attribute
+- Added `compressImages` option to Module project to compress images upon output.
 - Added additional logging messages
 
 ### Changed

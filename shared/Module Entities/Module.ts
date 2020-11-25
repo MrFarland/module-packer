@@ -2,6 +2,9 @@ import * as Archiver from 'archiver'
 import * as Cheerio from 'cheerio'
 import * as FileSystem from 'fs-extra'
 import * as GrayMatter from 'gray-matter'
+import * as ImageMin from 'imagemin'
+import * as ImageMinPngQuant from 'imagemin-pngquant'
+import * as ImageMinMozJpeg from 'imagemin-mozjpeg'
 import * as Path from 'path'
 import * as Logger from 'winston'
 import Slugify from 'slugify'
@@ -14,6 +17,8 @@ import { Group } from './Group'
 import { ModuleEntity, IncludeMode } from './ModuleEntity'
 import { Monster } from './Monster'
 import { Page } from './Page'
+import { Map } from './Map'
+import { Encounter } from './Encounter'
 
 /**
  * Represents an EncounterPlus module. Contains
@@ -63,10 +68,10 @@ export class Module {
   pages: Page[] = []
 
   /** The maps of the module */
-  maps: ModuleEntity[] = []
+  maps: Map[] = []
 
   /** The encounters of the module */
-  encounters: ModuleEntity[] = []
+  encounters: Encounter[] = []
 
   /** The monster associated with the module */
   monsters: Monster[] = []
@@ -215,32 +220,40 @@ export class Module {
     // are explicitly ignored).
     module.processDirectory(projectDirectory, moduleBuildPath)
 
-    // Reassign page parents when they are manually specified.
-    module.pages.forEach((page) => {
-      // If a new parent was not manually assigned, ignore
-      if (!page.parentPageSlug) {
-        return
-      }
-
-      // Find the requested new parent. If it doesn't exist
-      // ignore the parent assignment.
-      let newParent = module.pages.filter((parentPage) => {
-        return parentPage.slug == page.parentPageSlug
-      })[0]
-
-      if (!newParent) {
-        Logger.warn(`The specified parent, ${page.parentPageSlug}, for page ${page.slug} could not be found.`)
-        return
-      }
-
-      // Assign the new parent and append the page to the children of the new parent
-      if (page.parent) {
-        page.parent.children = page.parent.children.filter((childPage) => {
-          return childPage !== page
+    // Add Maps
+    let mapPromises: Promise<void>[] = []
+    if (!scanOnly) {
+      module.moduleProjectInfo.mapFiles.forEach(async (map) => {
+        let parseMapPromise = map.extractMapObject(moduleBuildPath, projectDirectory, module.moduleProjectInfo.id).then((mapObject) => {
+          module.maps.push(mapObject)
         })
+        mapPromises.push(parseMapPromise)
+      })
+
+      await Promise.all(mapPromises)
+    }
+
+    // Add Encounters
+    let encounterPromises: Promise<void>[] = []
+    if (!scanOnly) {
+      module.moduleProjectInfo.encounterFiles.forEach(async (encounter) => {
+        let parseEncounterPromise = encounter.extractEncounterObject(moduleBuildPath, projectDirectory, module.moduleProjectInfo.id).then((encounterObject) => {
+          module.encounters.push(encounterObject)
+        })
+        encounterPromises.push(parseEncounterPromise)
+      })
+
+      await Promise.all(encounterPromises)
+    }
+
+    // Resolve forced parent reassignments
+    let allEntities = module.getAllEntities()
+    allEntities.forEach((entity) => {
+      let parentSlug = entity.parentSlug
+      if(parentSlug !== undefined) {
+        entity.parent = allEntities.filter((entity) => { return entity.slug === parentSlug})[0]
+        entity.parent?.children.push(entity)
       }
-      page.parent = newParent
-      newParent.children.push(page)
     })
 
     // Prunes an entity and children from the tree
@@ -287,27 +300,25 @@ export class Module {
     // Filter entities based on whether they are marked for inclusion
     // in the particular build target
     let entitiesToRemove: ModuleEntity[] = []
-    entitiesToRemove.push(...getEntitiesToRemove(module.pages))
-    entitiesToRemove.push(...getEntitiesToRemove(module.groups))
-    entitiesToRemove.push(...getEntitiesToRemove(module.monsters))
+    entitiesToRemove.push(...getEntitiesToRemove(allEntities))
     entitiesToRemove.forEach((entity) => {
       removeEntityAndChildren(entity)
     })
 
     // Check for cyclic dependencies
-    module.pages.forEach((page) => {
+    allEntities.forEach((entity) => {
       const maxCycles = 50
-      let currentParent: ModuleEntity | undefined = page.parent
+      let currentParent: ModuleEntity | undefined = entity.parent
 
       let cycleCount = 0
       while (currentParent !== undefined) {
-        if (currentParent === page) {
-          throw Error(`The parent of the page "${[page.slug]}" is cyclic. Check the page-parent properties.`)
+        if (currentParent === entity) {
+          throw Error(`The entity "${[entity.slug]}" is cyclic. Check the parent properties of your items.`)
         }
         if (cycleCount > maxCycles) {
           // Shouldn't hit this unless someone nested crazy-deep, but it's a safety so the cyclic check doesn't spin forever.
           throw Error(
-            `The nested count of the page "${[page.slug]}" is exceeded ${maxCycles}. Page may be cyclic. Reduce or remove nesting.`
+            `The nested count of the entity "${[entity.slug]}" is exceeded ${maxCycles}. Entity may be cyclic. Reduce or remove nesting.`
           )
         }
         currentParent = currentParent.parent
@@ -317,6 +328,10 @@ export class Module {
     // Sort module children
     module.children = module.sortChildren(module.children)
 
+    if (!scanOnly && module.moduleProjectInfo.compressImages) {
+      await module.compressImages(moduleBuildPath)
+    } 
+    
     // Export module.xml file
     if (mode == ModuleMode.ModuleExport) {
       module.exportXML(moduleBuildPath)
@@ -363,6 +378,18 @@ export class Module {
   // ---------------------------------------------------------------
 
   /**
+   * Gets all entities combined into a single list
+   */
+  private getAllEntities = (): ModuleEntity[] => {
+    let allEntities: ModuleEntity[] = []
+    this.pages.forEach((page) => { allEntities.push(page) })
+    this.groups.forEach((group) => { allEntities.push(group) })
+    this.maps.forEach((map) => { allEntities.push(map) })
+    this.encounters.forEach((encounter) => { allEntities.push(encounter) })
+    return allEntities  
+  }
+
+  /**
    * Sorts an array of module entity by the "order" (or "sort") value.
    * Also sorts all the children of the children recursively.
    * @param children The module entity children.
@@ -382,6 +409,44 @@ export class Module {
 
       return aVal < bVal ? -1 : 1
     })
+  }
+
+  /**
+   * Compresses the images for the module
+   * @param moduleBuildPath The module build directory
+   */
+  private async compressImages(moduleBuildPath: string) {
+    let allImages = this.getAllDirectoryImages(moduleBuildPath)
+    let compressPromises: Promise<void>[] = []
+    let startSizeDictionary: { [filePath: string]: number } = {}
+
+    allImages.forEach(async (filePath) => {
+      let folder = Path.dirname(filePath)
+      startSizeDictionary[filePath] = FileSystem.statSync(filePath).size
+
+      let compressPromise = ImageMin([filePath], {
+        destination: folder,
+        glob: false,
+        plugins: [ImageMinMozJpeg({ quality: 70.0 }), ImageMinPngQuant.default({ quality: [0.6, 0.8] })],
+      }).then((compressResults) => {
+        compressResults.forEach(compressResult => {
+          let startSize = startSizeDictionary[compressResult.destinationPath]
+          if (!startSize) {
+            return
+          }
+          let finalSize = FileSystem.statSync(compressResult.destinationPath).size
+          if (!finalSize) {
+            return
+          }
+  
+          let fileName = Path.basename(compressResult.destinationPath)
+          Logger.info(`Compressed Image "${fileName}". Uncompressed size: ${startSize}. Compressed size: ${finalSize}.`)
+        })
+      })
+      compressPromises.push(compressPromise)
+    })   
+
+    await Promise.all(compressPromises)
   }
 
   /**
@@ -412,7 +477,7 @@ export class Module {
     })
 
     archive.pipe(archiveStream)
-    archive.glob('./**/!(compendium.xml)', { cwd: moduleBuildPath }) // Ignore compendium.xml for now
+    archive.glob('./**/*', { cwd: moduleBuildPath }) // Ignore compendium.xml for now
     await archive.finalize()
   }
 
@@ -451,11 +516,39 @@ export class Module {
       return { $: groupAttributes, name: group.name, slug: group.slug }
     })
 
+    // Map map data
+    let maps = this.maps.map((mapObject) => {
+      let mapAttributes = {
+        id: mapObject.id,
+        sort: mapObject.sort,
+        parent: mapObject.parent?.id,
+      }
+      let mapData: any = mapObject.mapData
+      mapData['$'] = mapAttributes
+      mapData['name'] = mapObject.name
+      mapData['slug'] = mapObject.slug
+      return mapData
+    })
+
+    // Map encounter data
+    let encounters = this.encounters.map((encounterObject) => {
+      let encounterAttributes = {
+        id: encounterObject.id,
+        sort: encounterObject.sort,
+        parent: encounterObject.parent?.id,
+      }
+      let encounterData: any = encounterObject.encounterData
+      encounterData['$'] = encounterAttributes
+      encounterData['name'] = encounterObject.name
+      encounterData['slug'] = encounterObject.slug
+      return encounterData
+    })
+
     // Map monster data
     let monsters = this.monsters.map((monster) => {
       let monsterImageFolder = Path.join(outputPath, 'monsters')
       if (!FileSystem.existsSync(monsterImageFolder)) {
-        FileSystem.mkdir(monsterImageFolder)
+        FileSystem.mkdirSync(monsterImageFolder)
       }
 
       let monsterAttributes = {
@@ -491,7 +584,6 @@ export class Module {
         int: monster.int,
         wis: monster.wis,
         cha: monster.cha,
-        role: monster.role,
         save: monster.saves,
         skill: monster.skills,
         vulnerable: monster.vulnerabilities,
@@ -532,20 +624,25 @@ export class Module {
       image: this.moduleProjectInfo.moduleCoverPath,
       group: groups,
       page: pages,
-    }
-
-    let compendiumData = {
-      monster: monsters,
+      map: maps,
+      encounter: encounters
     }
 
     let moduleBuilder = new XML2JS.Builder({ rootName: 'module' })
     let moduleXML = moduleBuilder.buildObject(moduleData)
 
-    let compendiumBuilder = new XML2JS.Builder({ rootName: 'compendium' })
-    let compendiumXML = compendiumBuilder.buildObject(compendiumData)
-
     FileSystem.writeFileSync(modulePath, moduleXML)
-    FileSystem.writeFileSync(compendiumPath, compendiumXML)
+    
+    let hasCompendiumData = monsters.length > 0
+    let compendiumData = {
+      monster: monsters,
+    }
+
+    if (hasCompendiumData) {
+      let compendiumBuilder = new XML2JS.Builder({ rootName: 'compendium' })
+      let compendiumXML = compendiumBuilder.buildObject(compendiumData)
+      FileSystem.writeFileSync(compendiumPath, compendiumXML)
+    }
   }
 
   /**
@@ -728,7 +825,13 @@ export class Module {
     let slug = frontMatter['slug'] as string
     let printMultiColumn = (frontMatter['pdf-page-style'] as string) !== 'single-column'
     let pagebreaks = forPrint ? (frontMatter['pdf-pagebreaks'] as string) : (frontMatter['module-pagebreaks'] as string)
-    let parentPage = frontMatter['parent-page'] as string
+    
+    // "parent-page" is the legacy way of defining the parent for a page
+    let parentSlug = frontMatter['parent-page'] as string
+    if (frontMatter['parent']) {
+      parentSlug = frontMatter['parent']
+    }    
+
     let pagebreakContentFound = false
 
     let includeIn = frontMatter['include-in']
@@ -766,32 +869,37 @@ export class Module {
 
     // If we have pagebreaks defined, we'll attempt to split
     // up, group, and subgroup content by header values
-    if (pagebreaks !== undefined && parentPage === undefined) {
+    if (pagebreaks !== undefined) {
       // Remove spaces from pagebreaks list
       pagebreaks = pagebreaks.replace(/\s/g, '')
 
       let $ = Cheerio.load(html)
-      let cover: CheerioElement | undefined = undefined
+      let cover: cheerio.Element | undefined = undefined
       let pagesByHeader: { [slug: string]: ModuleEntity } = {}
 
       let firstPageBreak = $('*').find(pagebreaks).first()
       $(firstPageBreak)
         .prevAll()
         .each((i, element) => {
-          if ($(element).find('.size-cover').length > 0) {
+          if ($(element).find('.size-cover,.size-full').length > 0) {
             cover = element
           }
         })
 
+      let nestedSortOrder = 0
       $(pagebreaks).each((i, element) => {
         let headerText = $(element).text()
 
         if (!scanOnly) {
-          Logger.info(`Parsing page ${headerText} from header ${element.tagName}`)
+          Logger.info(`Parsing page "${headerText}" from header "${element.tagName}"`)
         }
 
         // Create Page from current HTML
         let page = new Page(headerText, this.moduleProjectInfo.id, filePath)
+        if (!scanOnly) {
+          Logger.info(`Slug for page "${page.name}": ${page.slug}`)
+        }
+
         page.includeIn = ModuleEntity.getIncludeModeFromString(includeIn)
         page.content += $.html(element)
         page.sort = order
@@ -808,7 +916,7 @@ export class Module {
           .each((i, element) => {
             // Special case cover images - they will be moved
             // to the beginning of the page later
-            if ($(element).find('.size-cover').length > 0) {
+            if ($(element).find('.size-cover,.size-full').length > 0) {
               cover = element
             } else {
               page.content += $.html(element)
@@ -822,7 +930,7 @@ export class Module {
         let parentPagebreaks = Module.trim(pagebreaks.split(element.tagName)[0], ',')
 
         // Traverse backwards until we find the parent page break
-        let parentElement: Cheerio | undefined = undefined
+        let parentElement: cheerio.Cheerio | undefined = undefined
 
         // Parent page breaks will be "" if none exist
         if (parentPagebreaks) {
@@ -837,17 +945,20 @@ export class Module {
           if (pageParent) {
             page.parent = pageParent
             pageParent.children.push(page)
-            page.sort = undefined // Clear sort from nested pages
+            page.sort = nestedSortOrder
+            nestedSortOrder += 1
           } else {
             Logger.info(`Page for header "${parentHeader}" was not found. This is a bug in the module packer.`)
           }
         }
 
         // If the page has no parent and there is a group,
-        // make page belong to that group
+        // make page belong to that group. If a parent page
+        // is defined (for nested pages), use that.
         if ((parentElement === undefined || parentElement.length === 0) && parentGroup !== undefined) {
           page.parent = parentGroup
           parentGroup.children.push(page)
+          page.parentSlug = parentSlug
         }
 
         // Wrap page content in a page DIV when printing
@@ -878,10 +989,14 @@ export class Module {
     // to create page
     if (!pagebreakContentFound) {
       let page = new Page(pageName, this.moduleProjectInfo.id, filePath, slug)
+      if (!scanOnly) {
+        Logger.info(`Slug for page "${page.name}": ${page.slug}`)
+      }
+
       page.content = this.wrapPageInPrintDivs(html)
       page.includeIn = ModuleEntity.getIncludeModeFromString(includeIn)
       page.sort = order
-      page.parentPageSlug = parentPage
+      page.parentSlug = parentSlug
 
       if (parentGroup) {
         page.parent = parentGroup
@@ -929,7 +1044,7 @@ export class Module {
       Logger.info(`Anchor created: ${anchorID}`)
     })
 
-    return $.html()
+    return $('body').html() ?? pageContent
   }
 
   /**
@@ -968,7 +1083,7 @@ export class Module {
       }
     })
 
-    return $.html()
+    return $('body').html() ?? pageContent
   }
 
   /**
@@ -991,11 +1106,11 @@ export class Module {
     }
 
     $('img.size-cover').each((i, element) => {
-      $(element.parent).attr('class', 'size-cover')
+      $(element).parents('p').attr('class', 'size-cover')
     })
 
     $('img.size-full').each((i, element) => {
-      $(element.parent).attr('class', 'size-full')
+      $(element).parents('p').attr('class', 'size-full')
     })
 
     $('div.statblock.two-column').each((i, element) => {
@@ -1010,7 +1125,35 @@ export class Module {
       }
     })
 
-    return $.html()
+    return $('body').html() ?? pageContent
+  }
+
+  /**
+   * Gets all files and folders in a directory, recursively going through subdirectory
+   * @param directoryPath The directory path
+   */
+  private getAllDirectoryImages = (directoryPath: string): string[] => {
+    const imageExtensions = ['.jpeg', '.jpg', '.png']
+
+    let items: string[] = FileSystem.readdirSync(directoryPath)
+    let images: string[] = []
+
+    items.forEach((item) => {
+      let fullPath = Path.join(directoryPath, item)
+      if (FileSystem.statSync(fullPath).isDirectory()) {
+        let subDirImages = this.getAllDirectoryImages(fullPath)
+        subDirImages.forEach((image) => {
+          images.push(image)
+        })
+      } else {
+        let extension = Path.extname(fullPath)
+        if (imageExtensions.includes(extension)) {
+          images.push(fullPath)
+        }
+      }
+    })
+
+    return images
   }
 
   /**
